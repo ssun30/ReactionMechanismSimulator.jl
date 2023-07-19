@@ -7,6 +7,9 @@ using Sundials
 using SparseArrays
 using SciMLBase: build_solution
 using Base.Iterators: flatten
+using Printf
+using CUDA
+using Test
 
 abstract type AbstractTerminationCriterion end
 
@@ -308,6 +311,8 @@ function processfluxes(sim::SystemSimulation,
 
     dydt,rts,frts,rrts,radrts,cs = calcfluxes(sim)
 
+    print(corespcsinds, corerxnindx, edgespcsinds, edgerxninds)
+
     corespeciesrates = abs.(dydt[corespcsinds])
     charrate = sqrt(dot(corespeciesrates,corespeciesrates))
     radprod = 0.0
@@ -420,15 +425,65 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
 
     @inbounds corespeciesrates = abs.(dydt[corespcsinds])
     charrate = sqrt(dot(corespeciesrates,corespeciesrates))
-    radprod = 0.0
-    radloss = 0.0
-    for rt in radrts[corerxninds]
-        if rt > 0
-            radprod += rt
-        else
-            radloss -= rt
+
+    function rad_reduction_cpu!(radprod, radloss, radrts, corerxninds)
+
+        prod = 0.0
+        loss = 0.0
+        
+        for rt in radrts[corerxninds]
+            if rt > 0
+                prod += rt
+            else
+                loss -= rt
+            end
         end
+
+        radprod += prod
+        radloss += loss
+
+        return nothing
+
     end
+
+    # Begin CUDA version of radprod/radloss summation
+
+    function rad_reduction_gpu!(radprod, radloss, radrts, corerxninds)
+        radrts_gpu = cu(radrts)
+        corerxninds_gpu = cu(corerxninds)
+    
+        r1 = radrts_gpu[corerxninds_gpu]
+    
+        t1 = (r1 .> 0).*1
+        t2 = 1 .- t1
+    
+        prod = reduce(+, r1 .* t1)
+        loss = reduce(+, r1 .* t2)
+    
+        print(prod)
+        print(loss)
+        
+        radprod += prod
+        radloss += loss
+    
+        return nothing
+    end
+    
+    radprod_cpu = 0.0
+    radloss_cpu = 0.0
+    radprod_gpu = 0.0
+    radloss_gpu = 0.0
+
+    rad_reduction_cpu!(radprod_cpu, radloss_cpu, radrts, corerxninds)
+    
+    rad_reduction_gpu!(radprod_gpu, radloss_gpu, radrts, corerxninds)
+
+    # Verify results
+    @test (radprod_gpu == radprod_cpu) && (radloss_gpu == radloss_cpu)
+
+    radprod = radprod_cpu
+    radloss = radloss_cpu
+
     radcharrate = min(radprod,radloss)
     @inbounds edgespeciesrates = abs.(dydt[edgespcsinds])
     @inbounds edgereactionrates = rts[edgerxninds]
