@@ -447,42 +447,32 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
     end
 
     # Begin CUDA version of radprod/radloss summation
+    # Note: this part is commented out since it does NOT speed up execution
 
-    function rad_reduction_gpu!(radprod, radloss, radrts, corerxninds)
-        radrts_gpu = cu(radrts)
-        corerxninds_gpu = cu(corerxninds)
+    # function rad_reduction_gpu!(radprod, radloss, radrts, corerxninds)
+    #     radrts_gpu = cu(radrts)
+    #     corerxninds_gpu = cu(corerxninds)
     
-        r1 = radrts_gpu[corerxninds_gpu]
+    #     r1 = radrts_gpu[corerxninds_gpu]
     
-        t1 = (r1 .> 0).*1
-        t2 = 1 .- t1
+    #     t1 = (r1 .> 0).*1
+    #     t2 = 1 .- t1
     
-        prod = reduce(+, r1 .* t1)
-        loss = reduce(+, r1 .* t2)
-    
-        print(prod)
-        print(loss)
+    #     prod = reduce(+, r1 .* t1)
+    #     loss = reduce(+, r1 .* t2)
         
-        radprod += prod
-        radloss += loss
+    #     radprod += prod
+    #     radloss += loss
     
-        return nothing
-    end
+    #     return nothing
+    # end
     
-    radprod_cpu = 0.0
-    radloss_cpu = 0.0
-    radprod_gpu = 0.0
-    radloss_gpu = 0.0
+    radprod = 0.0
+    radloss = 0.0
 
-    rad_reduction_cpu!(radprod_cpu, radloss_cpu, radrts, corerxninds)
+    @timev rad_reduction_cpu!(radprod, radloss, radrts, corerxninds)
     
-    rad_reduction_gpu!(radprod_gpu, radloss_gpu, radrts, corerxninds)
-
-    # Verify results
-    @test (radprod_gpu == radprod_cpu) && (radloss_gpu == radloss_cpu)
-
-    radprod = radprod_cpu
-    radloss = radloss_cpu
+    # rad_reduction_gpu!(radprod_gpu, radloss_gpu, radrts, corerxninds)
 
     radcharrate = min(radprod,radloss)
     @inbounds edgespeciesrates = abs.(dydt[edgespcsinds])
@@ -493,43 +483,73 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
     edgerxnradrateratios = abs.(edgerxnradreactionrates)./radcharrate
     @inbounds corereactionrates = rts[corerxninds]
     @inbounds corespeciesconcentrations = cs[corespcsinds]
-    corespeciesconsumptionrates = zeros(length(corespeciesconcentrations))
-    corespeciesproductionrates = zeros(length(corespeciesconcentrations))
-    corespeciesnetconsumptionrates = zeros(length(corespeciesconcentrations))
-    coreradicalnetterminationrates = zeros(length(corespeciesconcentrations))
 
-    #process core species consumption and production rates
-    d = sim.domain
-    @inbounds for i = 1:size(d.rxnarray)[2]
-        if @inbounds  any(d.rxnarray[:,i].>length(corespeciesconcentrations))
-            continue
-        end
-        net_forward_rate = max(frts[i]-rrts[i], 0.0)
-        for j = 1:4
-            if @inbounds  d.rxnarray[j,i] != 0
-                @inbounds corespeciesconsumptionrates[d.rxnarray[j,i]] += frts[i]
-                @inbounds corespeciesproductionrates[d.rxnarray[j,i]] += rrts[i]
-                corespeciesnetconsumptionrates[d.rxnarray[j,i]] += net_forward_rate
-                if d.phase.species[d.rxnarray[j,i]].radicalelectrons == 1
-                    coreradicalnetterminationrates[d.rxnarray[j,i]] += net_forward_rate * abs(min(d.phase.reactions[i].radicalchange, 0.0))
+
+    #process core species consumption and production rates using CPU
+    function core_spc_conc_prod_rates_cpu(corespeciesconcentrations, d, frts, rrts)
+
+        l = length(corespeciesconcentrations)
+        
+        corespeciesconsumptionrates = zeros(l)
+        corespeciesproductionrates = zeros(l)
+        corespeciesnetconsumptionrates = zeros(l)
+        coreradicalnetterminationrates = zeros(l)
+        
+        @inbounds for i = 1:size(d.rxnarray)[2]
+            if @inbounds  any(d.rxnarray[:,i].>length(corespeciesconcentrations))
+                continue
+            end
+            net_forward_rate = max(frts[i]-rrts[i], 0.0)
+            for j = 1:4
+                if @inbounds  d.rxnarray[j,i] != 0
+                    @inbounds corespeciesconsumptionrates[d.rxnarray[j,i]] += frts[i]
+                    @inbounds corespeciesproductionrates[d.rxnarray[j,i]] += rrts[i]
+                    corespeciesnetconsumptionrates[d.rxnarray[j,i]] += net_forward_rate
+                    if d.phase.species[d.rxnarray[j,i]].radicalelectrons == 1
+                        coreradicalnetterminationrates[d.rxnarray[j,i]] += net_forward_rate * abs(min(d.phase.reactions[i].radicalchange, 0.0))
+                    end
+                else
+                    break
                 end
-            else
-                break
+            end
+            net_reverse_rate = max(rrts[i]-frts[i], 0.0)
+            for j = 5:8
+                if @inbounds  d.rxnarray[j,i] != 0
+                    @inbounds corespeciesproductionrates[d.rxnarray[j,i]] += frts[i]
+                    @inbounds corespeciesconsumptionrates[d.rxnarray[j,i]] += rrts[i]
+                    corespeciesnetconsumptionrates[d.rxnarray[j,i]] += net_reverse_rate
+                    if d.phase.species[d.rxnarray[j,i]].radicalelectrons == 1
+                        coreradicalnetterminationrates[d.rxnarray[j,i]] += net_reverse_rate * abs(min(-d.phase.reactions[i].radicalchange, 0.0))
+                    end
+                else
+                    break
+                end
             end
         end
-        net_reverse_rate = max(rrts[i]-frts[i], 0.0)
-        for j = 5:8
-            if @inbounds  d.rxnarray[j,i] != 0
-                @inbounds corespeciesproductionrates[d.rxnarray[j,i]] += frts[i]
-                @inbounds corespeciesconsumptionrates[d.rxnarray[j,i]] += rrts[i]
-                corespeciesnetconsumptionrates[d.rxnarray[j,i]] += net_reverse_rate
-                if d.phase.species[d.rxnarray[j,i]].radicalelectrons == 1
-                    coreradicalnetterminationrates[d.rxnarray[j,i]] += net_reverse_rate * abs(min(-d.phase.reactions[i].radicalchange, 0.0))
-                end
-            else
-                break
-            end
-        end
+
+        return corespeciesconsumptionrates, corespeciesproductionrates, corespeciesnetconsumptionrates, coreradicalnetterminationrates
+    end
+
+    # @timev (corespeciesproductionrates,corespeciesconsumptionrates,corespeciesnetconsumptionrates,coreradicalnetterminationrates) = core_spc_conc_prod_rates_cpu(corespeciesconcentrations, sim.domain, frts, rrts)
+
+    #process core species consumption and production rates using CPU
+    function core_spc_conc_prod_rates_gpu(corespeciesconcentrations, d, frts, rrts)
+        l = length(corespeciesconcentrations)
+        
+        corespeciesconsumptionrates = CUDA.zeros(l)
+        corespeciesproductionrates = CUDA.zeros(l)
+        corespeciesnetconsumptionrates = CUDA.zeros(l)
+        coreradicalnetterminationrates = CUDA.zeros(l)
+        
+        rxnarray = cu(d.rxnarray)
+        frts_d = cu(frts)
+        rrts_d = cu(rrts)
+
+        net_forward_rate = frts[i] .- rrts[i]
+        net_forward_rate = ifelse.(net_forward_rate.>0, net_forward_rate, 0)
+
+
+        return corespeciesconsumptionrates, corespeciesproductionrates, corespeciesnetconsumptionrates, coreradicalnetterminationrates       
     end
 
     return dydt,rts,frts,rrts,cs,corespeciesrates,charrate,edgespeciesrates,edgereactionrates,edgerxnradrateratios,corespeciesrateratios,edgespeciesrateratios,corereactionrates,corespeciesconcentrations,corespeciesproductionrates,corespeciesconsumptionrates,corespeciesnetconsumptionrates,coreradicalnetterminationrates
