@@ -551,9 +551,8 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
 
         # Create masks to eliminate IF branching
         mask1 = CUDA.ones(1, m)
-        mask2 = rxnarray.!=0
-        mask3 = mask1 .* mask2
-        mask4 = radicale .== 1
+        mask2 = mask1 .* (rxnarray.!=0)
+        mask3 = radicale .== 1
 
         # Calculate rates
         net_forward_rate = (frts[i] .- rrts[i]) .* mask1
@@ -561,15 +560,15 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
         net_forward_rate = ifelse.(net_forward_rate.>0, net_forward_rate, 0)
         net_reverse_rate = ifelse.(net_reverse_rate.>0, net_reverse_rate, 0)
 
-        corespeciesconsumptionrates[r1] = reduce(+, frts[r1] .* mask3[r1])
-        corespeciesconsumptionrates[r2] = reduce(+, rrts[r2] .* mask3[r2])
-        corespeciesproductionrates[r1] = reduce(+, rrts[r1] .* mask3[r1])
-        corespeciesproductionrates[r2] = reduce(+, frts[r2] .* mask3[r2])
-        corespeciesnetconsumptionrates[r1] = reduce(+, net_forward_rate .* mask3[r1])
-        corespeciesnetconsumptionrates[r2] = reduce(+, net_reverse_rate .* mask3[r2])
+        corespeciesconsumptionrates[r1] = reduce(+, frts[r1] .* mask2[r1])
+        corespeciesconsumptionrates[r2] = reduce(+, rrts[r2] .* mask2[r2])
+        corespeciesproductionrates[r1] = reduce(+, rrts[r1] .* mask2[r1])
+        corespeciesproductionrates[r2] = reduce(+, frts[r2] .* mask2[r2])
+        corespeciesnetconsumptionrates[r1] = reduce(+, net_forward_rate .* mask2[r1])
+        corespeciesnetconsumptionrates[r2] = reduce(+, net_reverse_rate .* mask2[r2])
         
-        coreradicalnetterminationrates[r1] = reduce(+, net_forward_rate .* radicalc[r1])
-        coreradicalnetterminationrates[r2] = reduce(+, net_reverse_rate .* radicalc[r2])
+        coreradicalnetterminationrates[r1] = reduce(+, net_forward_rate .* radicalc[r1] .* mask3)
+        coreradicalnetterminationrates[r2] = reduce(+, net_reverse_rate .* radicalc[r2] .* mask3)
 
         # Convert results back to regular Array
         output1 = Array(corespeciesconsumptionrates)
@@ -589,8 +588,8 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
         CUDA.unsafe_free!(radicalc)
         CUDA.unsafe_free!(mask1)
         CUDA.unsafe_free!(mask2)
+        CUDA.unsafe_free!(mask2)
         CUDA.unsafe_free!(mask3)
-        CUDA.unsafe_free!(mask4)
 
         return output1, output2, output3, output4       
     end
