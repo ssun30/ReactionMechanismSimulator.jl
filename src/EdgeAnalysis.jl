@@ -453,13 +453,13 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
     #     radrts_gpu = cu(radrts)
     #     corerxninds_gpu = cu(corerxninds)
     
-    #     r1 = radrts_gpu[corerxninds_gpu]
+    #     r1 = @view radrts_gpu[corerxninds_gpu]
     
-    #     t1 = (r1 .> 0).*1
-    #     t2 = 1 .- t1
+    #     mask1 = (r1 .> 0).*1
+    #     mask2 = 1 .- t1
     
-    #     prod = reduce(+, r1 .* t1)
-    #     loss = reduce(+, r1 .* t2)
+    #     prod = reduce(+, r1 .* mask1)
+    #     loss = reduce(+, r1 .* mask2)
         
     #     radprod += prod
     #     radloss += loss
@@ -530,27 +530,79 @@ function processfluxes(sim::Simulation,corespcsinds,corerxninds,edgespcsinds,edg
         return corespeciesconsumptionrates, corespeciesproductionrates, corespeciesnetconsumptionrates, coreradicalnetterminationrates
     end
 
-    # @timev (corespeciesproductionrates,corespeciesconsumptionrates,corespeciesnetconsumptionrates,coreradicalnetterminationrates) = core_spc_conc_prod_rates_cpu(corespeciesconcentrations, sim.domain, frts, rrts)
-
     #process core species consumption and production rates using CPU
     function core_spc_conc_prod_rates_gpu(corespeciesconcentrations, d, frts, rrts)
         l = length(corespeciesconcentrations)
-        
+        # Initialize CUArrays
         corespeciesconsumptionrates = CUDA.zeros(l)
         corespeciesproductionrates = CUDA.zeros(l)
         corespeciesnetconsumptionrates = CUDA.zeros(l)
         coreradicalnetterminationrates = CUDA.zeros(l)
-        
-        rxnarray = cu(d.rxnarray)
         frts_d = cu(frts)
         rrts_d = cu(rrts)
+        
+        # Create views of d.rxnarray to avoid duplicate array allocation
+        rxnarray = cu(d.rxnarray)
+        r1 = @view rxnarray[1:4,:]
+        r2 = @view rxnarray[5:8,:]
+        m = size(rxnarray)[2]
+        radicale = cu(d.phase.species[rxnarray].radicalelectrons)
+        radicalc = cu(abs(min(d.phase.reactions.radicalchange, 0.0)))
 
-        net_forward_rate = frts[i] .- rrts[i]
+        # Create masks to eliminate IF branching
+        mask1 = CUDA.ones(1, m)
+        mask2 = rxnarray.!=0
+        mask3 = mask1 .* mask2
+        mask4 = radicale .== 1
+
+        # Calculate rates
+        net_forward_rate = (frts[i] .- rrts[i]) .* mask1
+        net_reverse_rate = 0 .- net_forward_rate
         net_forward_rate = ifelse.(net_forward_rate.>0, net_forward_rate, 0)
+        net_reverse_rate = ifelse.(net_reverse_rate.>0, net_reverse_rate, 0)
 
+        corespeciesconsumptionrates[r1] = reduce(+, frts[r1] .* mask3[r1])
+        corespeciesconsumptionrates[r2] = reduce(+, rrts[r2] .* mask3[r2])
+        corespeciesproductionrates[r1] = reduce(+, rrts[r1] .* mask3[r1])
+        corespeciesproductionrates[r2] = reduce(+, frts[r2] .* mask3[r2])
+        corespeciesnetconsumptionrates[r1] = reduce(+, net_forward_rate .* mask3[r1])
+        corespeciesnetconsumptionrates[r2] = reduce(+, net_reverse_rate .* mask3[r2])
+        
+        coreradicalnetterminationrates[r1] = reduce(+, net_forward_rate .* radicalc[r1])
+        coreradicalnetterminationrates[r2] = reduce(+, net_reverse_rate .* radicalc[r2])
 
-        return corespeciesconsumptionrates, corespeciesproductionrates, corespeciesnetconsumptionrates, coreradicalnetterminationrates       
+        # Convert results back to regular Array
+        output1 = Array(corespeciesconsumptionrates)
+        output2 = Array(corespeciesproductionrates)
+        output3 = Array(corespeciesnetconsumptionrates)
+        output4 = Array(coreradicalnetterminationrates)
+
+        # Free up GPU memory
+        CUDA.unsafe_free!(corespeciesconsumptionrates)
+        CUDA.unsafe_free!(corespeciesproductionrates)
+        CUDA.unsafe_free!(corespeciesnetconsumptionrates)
+        CUDA.unsafe_free!(coreradicalnetterminationrates)
+        CUDA.unsafe_free!(frts_d)
+        CUDA.unsafe_free!(rrts_d)
+        CUDA.unsafe_free!(rxnarray)
+        CUDA.unsafe_free!(radicale)
+        CUDA.unsafe_free!(radicalc)
+        CUDA.unsafe_free!(mask1)
+        CUDA.unsafe_free!(mask2)
+        CUDA.unsafe_free!(mask3)
+        CUDA.unsafe_free!(mask4)
+
+        return output1, output2, output3, output4       
     end
+
+    @timev (cssr1, cspr1, csnr1, crntr1) = core_spc_conc_prod_rates_cpu(corespeciesconcentrations, d, frts, rrts)
+
+    @timev (cssr2, cspr2, csnr2, crntr2) = core_spc_conc_prod_rates_gpu(corespeciesconcentrations, d, frts, rrts)
+
+    corespeciesconcentrations = cssr1
+    corespeciesproductionrates = cspr1
+    corespeciesnetconsumptionrates = csnr1
+    coreradicalnetterminationrates = crntr1
 
     return dydt,rts,frts,rrts,cs,corespeciesrates,charrate,edgespeciesrates,edgereactionrates,edgerxnradrateratios,corespeciesrateratios,edgespeciesrateratios,corereactionrates,corespeciesconcentrations,corespeciesproductionrates,corespeciesconsumptionrates,corespeciesnetconsumptionrates,coreradicalnetterminationrates
 end
